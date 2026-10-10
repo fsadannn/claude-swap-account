@@ -1,0 +1,18 @@
+[workspace]
+members = ["core", "app"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Frank Sadan Naranjo Noda"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "s"
+strip = true
+
+[profile.dev]
+debug = "line-tables-only"

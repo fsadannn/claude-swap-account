@@ -1,0 +1,13 @@
+[package]
+name = "claude-swap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Back up and switch Claude Desktop accounts, one at a time"
+
+[dependencies]
+swap-core = { path = "../core" }
+iced = { version = "0.14", features = ["tokio"] }
+anyhow = "1"
+tokio = { version = "1", features = ["rt"] }
