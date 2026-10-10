@@ -4,6 +4,10 @@ A small personal Rust app to **back up and switch Claude Desktop accounts, one a
 Typical use: sign in to your **work** account while working, and when you finish, switch to your **personal** account
 (and back the next day) without signing in and out by hand.
 
+> **Windows only.** Claude Swap targets Claude Desktop for Windows (the Microsoft Store / MSIX install, with a fallback to
+> the classic `%APPDATA%\Claude` folder). Finding and closing Claude, reopening it (AUMID lookup) and the installer are
+> Windows-specific; macOS and Linux are not supported. Only the logic tests in `swap-core` run on other systems.
+
 > **Scope today: Claude Desktop only.** Claude Code (CLI / `~/.claude`) is *not* handled yet – see [TODO](#todo).
 > Nothing under `~/.claude` or `~/.claude.json` is read, copied or changed.
 
@@ -65,9 +69,9 @@ The newest N backups are kept per account folder: `Swapper::with_max_backups(Som
 Claude Desktop must be closed for a switch (the app can close it for you). Every overwrite is preceded by a backup;
 a failed switch is rolled back from it.
 
-## Build / run (Windows)
+## Build / run (Windows 10/11)
 ```
-cargo test -p swap-core                  # logic tests (run on any OS)
+cargo test -p swap-core                  # logic tests (these also run on other OSes)
 cargo run -p claude-swap                 # debug GUI
 cargo build -p claude-swap --release     # -> target\release\claude-swap.exe
 ```
