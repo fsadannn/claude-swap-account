@@ -11,3 +11,6 @@ swap-core = { path = "../core" }
 iced = { version = "0.14", features = ["tokio"] }
 anyhow = "1"
 tokio = { version = "1", features = ["rt"] }
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

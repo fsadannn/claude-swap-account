@@ -13,7 +13,11 @@ fn main() -> iced::Result {
         .title("Claude Swap")
         .subscription(App::subscription)
         .theme(|_: &App| Theme::Dark)
-        .window_size((600.0, 720.0))
+        .window(iced::window::Settings {
+            size: iced::Size::new(600.0, 720.0),
+            icon: iced::window::icon::from_rgba(include_bytes!("../assets/icon-128.rgba").to_vec(), 128, 128).ok(),
+            ..Default::default()
+        })
         .run()
 }
 
