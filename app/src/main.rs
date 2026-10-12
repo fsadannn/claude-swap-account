@@ -1,12 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 //! claude-swap GUI (iced). Contains no backup/switch logic: every action calls `swap_core::Swapper`
-//! on a background thread. Scope today: Claude Desktop only (Claude Code support is a README TODO).
+//! on a background thread. Claude Desktop and the Claude Code CLI are handled as two separate instances
+//! (each with its own accounts, active account and backups) and are tagged "Desktop" / "CLI" everywhere.
 
 use iced::widget::{button, column, container, row, scrollable, text, text_input, toggler, Container, Space};
-use iced::{time, Element, Length, Subscription, Task, Theme};
+use iced::{time, Background, Border, Color, Element, Length, Subscription, Task, Theme};
 use std::time::Duration;
-use swap_core::{LargeItem, Status, Swapper};
+use swap_core::{Instance, InstanceStatus, LargeItem, Meta, Status, Swapper};
 
 fn main() -> iced::Result {
     iced::application(App::new, App::update, App::view)
@@ -14,7 +15,7 @@ fn main() -> iced::Result {
         .subscription(App::subscription)
         .theme(|_: &App| Theme::Dark)
         .window(iced::window::Settings {
-            size: iced::Size::new(600.0, 720.0),
+            size: iced::Size::new(640.0, 760.0),
             icon: iced::window::icon::from_rgba(include_bytes!("../assets/icon-128.rgba").to_vec(), 128, 128).ok(),
             ..Default::default()
         })
@@ -38,10 +39,10 @@ fn e2s(e: anyhow::Error) -> String {
 
 #[derive(Debug, Clone)]
 enum Confirm {
-    Delete(String),
-    NewAccount,
-    Overwrite(String),
-    Recover,
+    Delete(Instance, String),
+    NewAccount(Instance),
+    Overwrite(Instance, String),
+    Recover(Instance),
 }
 
 struct App {
@@ -50,7 +51,10 @@ struct App {
     msg: Option<(bool, String)>,
     busy: bool,
     name: String,
-    rename: Option<(String, String)>,
+    /// which instance "Save current login" / "+ Add new account" act on
+    target: Instance,
+    /// (instance, old name, new name)
+    rename: Option<(Instance, String, String)>,
     confirm: Option<Confirm>,
     large: Vec<LargeItem>,
     tab: Tab,
@@ -71,15 +75,16 @@ enum Msg {
     Status(Result<Status, String>),
     Done(Result<String, String>),
     NameChanged(String),
+    SetTarget(Instance),
     SaveClicked,
-    Switch(String),
+    Switch(Instance, String),
     Ask(Confirm),
     Yes,
     No,
     NewAccount,
     CloseClaude,
     Launch,
-    RenameStart(String),
+    RenameStart(Instance, String),
     RenameInput(String),
     RenameOk,
     RenameCancel,
@@ -90,12 +95,13 @@ enum Msg {
     MaxInput(String),
     ThrInput(String),
     SaveSettings,
-    BackupNow,
+    BackupNow(Instance),
     OpenStore,
     OpenBackups,
     Unexclude(String),
     Unkeep(String),
     ToggleGit(bool),
+    ToggleCodeSessions(bool),
 }
 
 /// Short-lived notices: dropped as soon as the status poll shows they are no longer news
@@ -131,10 +137,30 @@ fn run_msg(f: impl FnOnce() -> Result<String, String> + Send + 'static) -> Task<
     Task::perform(blocking(f), Msg::Done)
 }
 
+/// Colored "Desktop" / "CLI" tag.
+fn badge<'a>(i: Instance) -> Element<'a, Msg> {
+    let c = match i {
+        Instance::Desktop => Color::from_rgb(0.45, 0.65, 1.0),
+        Instance::Code => Color::from_rgb(1.0, 0.70, 0.30),
+    };
+    container(text(i.label()).size(11).color(c))
+        .padding([2, 7])
+        .style(move |_: &Theme| container::Style {
+            background: Some(Background::Color(Color { a: 0.16, ..c })),
+            border: Border { color: Color { a: 0.55, ..c }, width: 1.0, radius: 4.0.into() },
+            ..Default::default()
+        })
+        .into()
+}
+
 impl App {
     fn new() -> (App, Task<Msg>) {
         (
-            App { status: None, msg: None, busy: false, name: String::new(), rename: None, confirm: None, large: vec![], tab: Tab::Accounts, max_input: String::new(), thr_input: String::new(), settings_loaded: false },
+            App {
+                status: None, msg: None, busy: false, name: String::new(), target: Instance::Desktop, rename: None,
+                confirm: None, large: vec![], tab: Tab::Accounts, max_input: String::new(), thr_input: String::new(),
+                settings_loaded: false,
+            },
             Task::batch([refresh(), scan_large()]),
         )
     }
@@ -149,7 +175,7 @@ impl App {
         t
     }
 
-    fn running(&self) -> bool { self.status.as_ref().map(|s| s.claude_running).unwrap_or(false) }
+    fn running(&self, i: Instance) -> bool { self.status.as_ref().map(|s| s.get(i).running).unwrap_or(false) }
 
     fn update(&mut self, m: Msg) -> Task<Msg> {
         match m {
@@ -163,8 +189,8 @@ impl App {
                             self.settings_loaded = true;
                         }
                         let transient = match self.msg.as_ref().map(|(ok, t)| (*ok, t.as_str())) {
-                            Some((true, LAUNCHING)) => s.claude_running,
-                            Some((true, CLOSED)) => !s.claude_running,
+                            Some((true, LAUNCHING)) => s.desktop.running,
+                            Some((true, CLOSED)) => !s.desktop.running,
                             _ => false,
                         };
                         if transient { self.msg = None; }
@@ -180,19 +206,23 @@ impl App {
                 Task::batch([refresh(), scan_large()])
             }
             Msg::NameChanged(s) => { self.name = s; Task::none() }
+            Msg::SetTarget(i) => { self.target = i; Task::none() }
             Msg::SaveClicked => {
                 let n = self.name.trim().to_string();
                 if n.is_empty() { self.msg = Some((false, "Enter a name first".into())); return Task::none(); }
-                let exists = self.status.as_ref().map(|s| s.accounts.iter().any(|a| a.name == n)).unwrap_or(false);
-                if exists { self.confirm = Some(Confirm::Overwrite(n)); return Task::none(); }
-                self.save(n, false)
+                let i = self.target;
+                let exists = self.status.as_ref().map(|s| s.get(i).accounts.iter().any(|a| a.name == n)).unwrap_or(false);
+                if exists { self.confirm = Some(Confirm::Overwrite(i, n)); return Task::none(); }
+                self.save(i, n, false)
             }
-            Msg::Switch(n) => {
-                let close = self.running();
-                let _ = close; // switching requires Claude closed; button is disabled while running
-                let t = run("Switched – Claude is starting", move || {
-                    sw()?.switch_and_launch(&n, false).map_err(e2s)
-                });
+            Msg::Switch(i, n) => {
+                let t = run(
+                    match i {
+                        Instance::Desktop => "Switched – Claude is starting",
+                        Instance::Code => "Switched the CLI account – new `claude` sessions use it",
+                    },
+                    move || sw()?.switch_and_launch(i, &n, false).map_err(e2s),
+                );
                 self.start(t)
             }
             Msg::Ask(c) => { self.confirm = Some(c); Task::none() }
@@ -200,24 +230,28 @@ impl App {
             Msg::Yes => {
                 let Some(c) = self.confirm.take() else { return Task::none() };
                 match c {
-                    Confirm::Delete(n) => {
-                        let t = run("Deleted", move || sw()?.delete_account(&n).map_err(e2s));
+                    Confirm::Delete(i, n) => {
+                        let t = run("Deleted", move || sw()?.delete_account(i, &n).map_err(e2s));
                         self.start(t)
                     }
-                    Confirm::Overwrite(n) => self.save(n, true),
-                    Confirm::NewAccount => {
-                        let t = run("Sign in to the new account in the Claude window, close Claude, then press “Save current login”.", || {
-                            sw()?.start_new_account(true).map_err(e2s)
-                        });
+                    Confirm::Overwrite(i, n) => self.save(i, n, true),
+                    Confirm::NewAccount(i) => {
+                        let t = run(
+                            match i {
+                                Instance::Desktop => "Sign in to the new account in the Claude window, close Claude, then press “Save current login”.",
+                                Instance::Code => "Signed out of the CLI. Run `claude` and log in with the new account, close all CLI sessions, then press “Save current login”.",
+                            },
+                            move || sw()?.start_new_account(i, true).map_err(e2s),
+                        );
                         self.start(t)
                     }
-                    Confirm::Recover => {
-                        let t = run("Previous state restored", || sw()?.recover_closing(true).map(|_| ()).map_err(e2s));
+                    Confirm::Recover(i) => {
+                        let t = run("Previous state restored", move || sw()?.recover_closing(i, true).map(|_| ()).map_err(e2s));
                         self.start(t)
                     }
                 }
             }
-            Msg::NewAccount => { self.confirm = Some(Confirm::NewAccount); Task::none() }
+            Msg::NewAccount => { self.confirm = Some(Confirm::NewAccount(self.target)); Task::none() }
             Msg::CloseClaude => {
                 let t = run(CLOSED, || swap_core::kill_desktop().map(|_| ()).map_err(e2s));
                 self.start(t)
@@ -262,12 +296,12 @@ impl App {
                 });
                 self.start(t)
             }
-            Msg::BackupNow => {
-                let t = run_msg(|| {
-                    let r = sw()?.backup_now().map_err(e2s)?;
-                    let mut m = format!("Backup saved ({})", human(r.size_bytes));
+            Msg::BackupNow(i) => {
+                let t = run_msg(move || {
+                    let r = sw()?.backup_now(i).map_err(e2s)?;
+                    let mut m = format!("{} backup saved ({})", i.label(), human(r.size_bytes));
                     if r.live {
-                        m.push_str(" – Claude was running, so this is a best-effort backup");
+                        m.push_str(" – it was running, so this is a best-effort backup");
                         if !r.skipped.is_empty() { m.push_str(&format!("; {} file(s) were locked and skipped", r.skipped.len())); }
                     }
                     Ok(m)
@@ -297,26 +331,31 @@ impl App {
                     move || sw()?.set_backup_git(on).map_err(e2s));
                 self.start(t)
             }
+            Msg::ToggleCodeSessions(on) => {
+                let t = run(if on { "CLI sessions are now included in backups" } else { "CLI sessions are no longer included in backups" },
+                    move || sw()?.set_backup_code_sessions(on).map_err(e2s));
+                self.start(t)
+            }
             Msg::Unkeep(k) => {
                 let t = run("Will warn about it again if it is large", move || sw()?.forget_acknowledged(&k).map_err(e2s));
                 self.start(t)
             }
-            Msg::RenameStart(n) => { self.rename = Some((n.clone(), n)); Task::none() }
-            Msg::RenameInput(s) => { if let Some((_, v)) = self.rename.as_mut() { *v = s; } Task::none() }
+            Msg::RenameStart(i, n) => { self.rename = Some((i, n.clone(), n)); Task::none() }
+            Msg::RenameInput(s) => { if let Some((_, _, v)) = self.rename.as_mut() { *v = s; } Task::none() }
             Msg::RenameCancel => { self.rename = None; Task::none() }
             Msg::RenameOk => {
-                let Some((old, new)) = self.rename.take() else { return Task::none() };
+                let Some((i, old, new)) = self.rename.take() else { return Task::none() };
                 let new = new.trim().to_string();
                 if new == old || new.is_empty() { return Task::none(); }
-                let t = run("Renamed", move || sw()?.rename_account(&old, &new).map_err(e2s));
+                let t = run("Renamed", move || sw()?.rename_account(i, &old, &new).map_err(e2s));
                 self.start(t)
             }
         }
     }
 
-    fn save(&mut self, name: String, overwrite: bool) -> Task<Msg> {
+    fn save(&mut self, i: Instance, name: String, overwrite: bool) -> Task<Msg> {
         self.name.clear();
-        let t = run("Saved", move || sw()?.save_login(&name, overwrite).map_err(e2s));
+        let t = run("Saved", move || sw()?.save_login(i, &name, overwrite).map_err(e2s));
         self.start(t)
     }
 
@@ -325,22 +364,27 @@ impl App {
 
         col = col.push(card(column![
             text("What is backed up and switched").size(16),
-            text("Claude Desktop: the app data folder – sign-in, MCP config (claude_desktop_config.json), extensions. Backups also hold Cowork / Desktop sessions.").size(13),
-            text("Claude Code (CLI, ~/.claude): not handled yet – planned. Nothing under ~/.claude is read, copied or changed.").size(12),
+            row![badge(Instance::Desktop), text("the app data folder – sign-in, MCP config (claude_desktop_config.json), extensions. Backups also hold Cowork / Desktop sessions.").size(13)].spacing(8),
+            row![badge(Instance::Code), text("~/.claude and the login/MCP keys of ~/.claude.json – credentials, settings, skills, commands, agents, plugins.").size(13)].spacing(8),
+            text("Each one has its own accounts, active account and backups, and can run at the same time as the other.").size(12),
         ].spacing(6).into()));
 
         let eff = self.status.as_ref().map(|s| s.max_backups).unwrap_or(0);
         col = col.push(card(column![
             text("Backups").size(16),
             row![
-                text("Max backups kept per account").width(Length::Fill),
+                text("Max backups kept per account (for Desktop and CLI each)").width(Length::Fill),
                 text_input("default", &self.max_input).on_input(Msg::MaxInput).width(110),
             ].spacing(8).align_y(iced::Center),
             text(format!("Empty = built-in default. Currently keeping {eff} per account.")).size(12),
             toggler(self.status.as_ref().map(|s| s.settings.backup_git).unwrap_or(false))
-                .label("Include git data in backups (git-shadow, git-worktrees.json, scratch-workspaces)")
+                .label("Desktop: include git data in backups (git-shadow, git-worktrees.json, scratch-workspaces)")
                 .on_toggle(Msg::ToggleGit),
             text("Off by default because these can be large. Backups never restore less than what is inside them.").size(12),
+            toggler(self.status.as_ref().map(|s| s.settings.backup_code_sessions).unwrap_or(true))
+                .label("CLI: include sessions in backups (projects, todos, plans, history.jsonl)")
+                .on_toggle(Msg::ToggleCodeSessions),
+            text("On by default. Turn it off if the transcripts get too big; account switching never touches them.").size(12),
             row![
                 text("Warn when a folder/file is bigger than (MB)").width(Length::Fill),
                 text_input("100", &self.thr_input).on_input(Msg::ThrInput).width(110),
@@ -383,8 +427,63 @@ impl App {
         scrollable(col).height(Length::Fill).into()
     }
 
+    /// One line of the status card: badge, state, signed-in e-mail, active account and the buttons.
+    fn instance_row<'a>(&self, s: &'a InstanceStatus) -> Element<'a, Msg> {
+        let i = s.instance;
+        let line = format!(
+            "{}{}{}",
+            match (i, s.running) {
+                (Instance::Desktop, true) => "Claude Desktop is running",
+                (Instance::Desktop, false) => "Claude Desktop is closed",
+                (Instance::Code, true) => "CLI session(s) running",
+                (Instance::Code, false) => "No CLI session running",
+            },
+            s.live_email.as_ref().map(|m| format!("   ·   Signed in: {m}")).unwrap_or_default(),
+            s.active.as_ref().map(|a| format!("   ·   Active: {a}")).unwrap_or_default(),
+        );
+        let mut bk = button("Back up now").style(button::secondary);
+        if !self.busy { bk = bk.on_press(Msg::BackupNow(i)); }
+        let mut r = row![badge(i), text(line).size(13).width(Length::Fill), bk].spacing(8).align_y(iced::Center);
+        if i == Instance::Desktop {
+            let mut close_btn = button("Close Claude").style(button::secondary);
+            if s.running && !self.busy { close_btn = close_btn.on_press(Msg::CloseClaude); }
+            let mut open_btn = button("Open Claude").style(button::secondary);
+            if !self.busy { open_btn = open_btn.on_press(Msg::Launch); }
+            r = r.push(close_btn).push(open_btn);
+        }
+        r.into()
+    }
+
+    fn account_card<'a>(&self, i: Instance, a: &'a Meta, active: Option<&str>) -> Element<'a, Msg> {
+        if let Some((ri, old, val)) = &self.rename {
+            if *ri == i && old == &a.name {
+                return card(row![
+                    badge(i),
+                    text_input("new name", val).on_input(Msg::RenameInput).on_submit(Msg::RenameOk).width(Length::Fill),
+                    button("OK").style(button::primary).on_press(Msg::RenameOk),
+                    button("Cancel").style(button::secondary).on_press(Msg::RenameCancel),
+                ].spacing(8).align_y(iced::Center).into()).into();
+            }
+        }
+        let cur = active == Some(a.name.as_str());
+        let title = if cur { format!("{}  (active)", a.name) } else { a.name.clone() };
+        let mut sw_btn = button(if cur { "Reload" } else { "Switch" })
+            .style(if cur { button::secondary } else { button::primary });
+        if !self.running(i) && !self.busy { sw_btn = sw_btn.on_press(Msg::Switch(i, a.name.clone())); }
+        let mut rn = button("Rename").style(button::secondary);
+        let mut del = button("Delete").style(button::danger);
+        if !self.busy {
+            rn = rn.on_press(Msg::RenameStart(i, a.name.clone()));
+            del = del.on_press(Msg::Ask(Confirm::Delete(i, a.name.clone())));
+        }
+        card(row![
+            badge(i),
+            column![text(title).size(15), text(a.email.clone().unwrap_or_default()).size(12)].width(Length::Fill),
+            sw_btn, rn, del,
+        ].spacing(8).align_y(iced::Center).into()).into()
+    }
+
     fn view(&self) -> Element<'_, Msg> {
-        let running = self.running();
         let mut page = column![].spacing(12).padding(16);
 
         let tab_btn = |label: &'static str, t: Tab| {
@@ -398,28 +497,17 @@ impl App {
                 tab_btn("Settings", Tab::Settings),
             ].spacing(8).align_y(iced::Center),
         );
-        page = page.push(text("One Claude account at a time – Claude Desktop").size(13));
+        page = page.push(text("One account at a time per instance – Claude Desktop and Claude Code CLI").size(13));
 
-        // --- Claude status card
-        let status_line = match &self.status {
-            None => "Loading…".to_string(),
-            Some(s) => format!(
-                "Claude Desktop is {}{}{}",
-                if s.claude_running { "running" } else { "closed" },
-                s.live_email.as_ref().map(|m| format!("   ·   Signed in: {m}")).unwrap_or_default(),
-                s.active.as_ref().map(|a| format!("   ·   Active: {a}")).unwrap_or_default()
-            ),
-        };
-        let mut close_btn = button("Close Claude").style(button::secondary);
-        if running && !self.busy { close_btn = close_btn.on_press(Msg::CloseClaude); }
-        let mut open_btn = button("Open Claude").style(button::secondary);
-        if !self.busy { open_btn = open_btn.on_press(Msg::Launch); }
-        let mut bk_btn = button("Back up now").style(button::secondary);
-        if !self.busy { bk_btn = bk_btn.on_press(Msg::BackupNow); }
-        page = page.push(
-            container(row![text(status_line).size(13).width(Length::Fill), bk_btn, close_btn, open_btn].spacing(8).align_y(iced::Center))
-                .padding(12).style(container::rounded_box).width(Length::Fill),
-        );
+        // --- status card: one row per instance
+        let mut status_col = column![].spacing(8);
+        match &self.status {
+            None => status_col = status_col.push(text("Loading…").size(13)),
+            Some(s) => {
+                for i in Instance::ALL { status_col = status_col.push(self.instance_row(s.get(i))); }
+            }
+        }
+        page = page.push(card(status_col.into()));
 
         // --- message
         if let Some((ok, t)) = &self.msg {
@@ -435,12 +523,14 @@ impl App {
                 ex = ex.on_press(Msg::ExcludeItem(it.root.clone(), it.name.clone()));
                 keep = keep.on_press(Msg::KeepItem(it.root.clone(), it.name.clone()));
             }
+            let tag = Instance::from_key(&it.root).map(badge);
+            let mut r = row![].spacing(8).align_y(iced::Center);
+            if let Some(t) = tag { r = r.push(t); }
             page = page.push(
-                container(row![
-                    text(format!("Large item: {}/{} is {} and is included in every backup and account snapshot.", it.root, it.name, human(it.bytes)))
-                        .size(13).width(Length::Fill),
-                    ex, keep,
-                ].spacing(8).align_y(iced::Center))
+                container(r
+                    .push(text(format!("Large item: {}/{} is {} and is included in every backup and account snapshot.", it.root, it.name, human(it.bytes)))
+                        .size(13).width(Length::Fill))
+                    .push(ex).push(keep))
                 .padding(12).style(container::bordered_box).width(Length::Fill),
             );
         }
@@ -448,10 +538,11 @@ impl App {
         // --- confirmation banner
         if let Some(c) = &self.confirm {
             let q = match c {
-                Confirm::Delete(n) => format!("Delete saved account “{n}”? (the live login is not touched)"),
-                Confirm::Overwrite(n) => format!("“{n}” already exists. Overwrite it with the current login?"),
-                Confirm::NewAccount => "Store the current account, sign Claude out and open it so you can log in to another account?".to_string(),
-                Confirm::Recover => "Undo the interrupted switch / add-account and restore the previous state?".to_string(),
+                Confirm::Delete(i, n) => format!("Delete saved {} account “{n}”? (the live login is not touched)", i.label()),
+                Confirm::Overwrite(i, n) => format!("{} account “{n}” already exists. Overwrite it with the current login?", i.label()),
+                Confirm::NewAccount(Instance::Desktop) => "Store the current Desktop account, sign Claude out and open it so you can log in to another account?".to_string(),
+                Confirm::NewAccount(Instance::Code) => "Store the current CLI account and sign the CLI out so you can log in to another account (run `claude` afterwards)? All CLI sessions must be closed.".to_string(),
+                Confirm::Recover(i) => format!("Undo the interrupted {} switch / add-account and restore the previous state?", i.label()),
             };
             page = page.push(
                 container(row![
@@ -464,14 +555,20 @@ impl App {
         }
 
         // --- recovery
-        if self.status.as_ref().map(|s| s.pending_recovery).unwrap_or(false) && self.confirm.is_none() {
-            page = page.push(
-                container(row![
-                    text("An add-account / switch was interrupted. You can undo it.").size(13).width(Length::Fill),
-                    button("Recover previous state").style(button::secondary).on_press(Msg::Ask(Confirm::Recover)),
-                ].spacing(8).align_y(iced::Center))
-                .padding(12).style(container::rounded_box).width(Length::Fill),
-            );
+        if self.confirm.is_none() {
+            if let Some(s) = &self.status {
+                for i in Instance::ALL {
+                    if !s.get(i).pending_recovery { continue; }
+                    page = page.push(
+                        container(row![
+                            badge(i),
+                            text("An add-account / switch was interrupted. You can undo it.").size(13).width(Length::Fill),
+                            button("Recover previous state").style(button::secondary).on_press(Msg::Ask(Confirm::Recover(i))),
+                        ].spacing(8).align_y(iced::Center))
+                        .padding(12).style(container::rounded_box).width(Length::Fill),
+                    );
+                }
+            }
         }
 
         if self.tab == Tab::Settings {
@@ -480,70 +577,61 @@ impl App {
         }
 
         // --- accounts
+        let target = self.target;
+        let tgt_btn = |i: Instance| {
+            button(i.label()).style(if target == i { button::primary } else { button::secondary }).on_press(Msg::SetTarget(i))
+        };
         let mut add = button("+ Add new account").style(button::primary);
         if !self.busy { add = add.on_press(Msg::NewAccount); }
-        page = page.push(row![text("Accounts").size(16).width(Length::Fill), add].align_y(iced::Center));
+        page = page.push(
+            row![
+                text("Accounts").size(16).width(Length::Fill),
+                text("For:").size(13),
+                tgt_btn(Instance::Desktop),
+                tgt_btn(Instance::Code),
+                add,
+            ].spacing(8).align_y(iced::Center),
+        );
 
         let mut list = column![].spacing(8);
         match &self.status {
-            Some(s) if !s.accounts.is_empty() => {
-                for a in &s.accounts {
-                    let cur = s.active.as_deref() == Some(a.name.as_str());
-                    if let Some((old, val)) = &self.rename {
-                        if old == &a.name {
-                            list = list.push(
-                                container(row![
-                                    text_input("new name", val).on_input(Msg::RenameInput).on_submit(Msg::RenameOk).width(Length::Fill),
-                                    button("OK").style(button::primary).on_press(Msg::RenameOk),
-                                    button("Cancel").style(button::secondary).on_press(Msg::RenameCancel),
-                                ].spacing(8).align_y(iced::Center))
-                                .padding(12).style(container::rounded_box).width(Length::Fill),
-                            );
-                            continue;
-                        }
+            Some(s) if !s.desktop.accounts.is_empty() || !s.code.accounts.is_empty() => {
+                for i in Instance::ALL {
+                    let st = s.get(i);
+                    for a in &st.accounts {
+                        list = list.push(self.account_card(i, a, st.active.as_deref()));
                     }
-                    let title = if cur { format!("{}  (active)", a.name) } else { a.name.clone() };
-                    let mut sw_btn = button(if cur { "Reload" } else { "Switch" })
-                        .style(if cur { button::secondary } else { button::primary });
-                    if !running && !self.busy { sw_btn = sw_btn.on_press(Msg::Switch(a.name.clone())); }
-                    let mut rn = button("Rename").style(button::secondary);
-                    let mut del = button("Delete").style(button::danger);
-                    if !self.busy {
-                        rn = rn.on_press(Msg::RenameStart(a.name.clone()));
-                        del = del.on_press(Msg::Ask(Confirm::Delete(a.name.clone())));
-                    }
-                    list = list.push(
-                        container(row![
-                            column![text(title).size(15), text(a.email.clone().unwrap_or_default()).size(12)].width(Length::Fill),
-                            sw_btn, rn, del,
-                        ].spacing(8).align_y(iced::Center))
-                        .padding(12).style(container::rounded_box).width(Length::Fill),
-                    );
                 }
             }
             Some(_) => {
-                list = list.push(text("No saved accounts yet. Sign in to Claude, close it, then save the login below.").size(13));
+                list = list.push(text("No saved accounts yet. Sign in to Claude (Desktop or CLI), close it, pick it with “For:” above and save the login below.").size(13));
             }
             None => {}
         }
         page = page.push(scrollable(list).height(Length::Fill));
 
         // --- save current login
-        let can_save = !running && !self.busy && self.status.as_ref().map(|s| s.desktop_signed_in).unwrap_or(false);
+        let can_save = !self.running(target) && !self.busy && self.status.as_ref().map(|s| s.get(target).signed_in).unwrap_or(false);
         let mut save = button("Save current login").style(button::primary);
         if can_save { save = save.on_press(Msg::SaveClicked); }
-        let mut input = text_input("Name for the account Claude is signed in to (e.g. Work)", &self.name).width(Length::Fill);
+        let mut input = text_input(&format!("Name for the {} account that is signed in (e.g. Work)", target.label()), &self.name).width(Length::Fill);
         if can_save { input = input.on_input(Msg::NameChanged).on_submit(Msg::SaveClicked); }
         page = page.push(
             container(column![
-                text("Signed in to an account that isn't saved yet? Close Claude and give it a name:").size(13),
+                row![
+                    badge(target),
+                    text(match target {
+                        Instance::Desktop => "Signed in to an account that isn't saved yet? Close Claude and give it a name:",
+                        Instance::Code => "Signed in to an account that isn't saved yet? Close all CLI sessions and give it a name:",
+                    }).size(13),
+                ].spacing(8).align_y(iced::Center),
                 row![input, save].spacing(8),
             ].spacing(8)).padding(12).style(container::rounded_box).width(Length::Fill),
         );
 
         // --- paths
         if let Some(s) = &self.status {
-            page = page.push(text(format!("Data: {}\nStore: {}", s.desktop_dir, s.store_dir)).size(11));
+            page = page.push(text(format!("Desktop data: {}\nCLI data: {}\nStore: {}", s.desktop.dir, s.code.dir, s.store_dir)).size(11));
         }
         page = page.push(Space::new().height(0));
         page.into()
